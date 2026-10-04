@@ -1,7 +1,13 @@
 --[[
-    DM Arena Hub - MOBILE EDITION
-    Подходит для: Delta, Codex, Arceus X, Fluxus, Hydrogen, Vega X, Ronin
-    Управление: плавающие кнопки на экране
+    DM Arena Hub - FULL EDITION
+    ПК + Mobile + Anti-Detect (игровые античиты)
+    
+    Встроено:
+    - Property Spoofing (WalkSpeed, JumpPower)
+    - Блокировка honeypot RemoteEvent
+    - Мониторинг новых Script/LocalScript
+    - Безопасная симуляция ввода
+    - FOV, Smoothing, ESP, Aimbot, Speed
 ]]
 
 -- =============================================================================
@@ -13,9 +19,18 @@ local Players          = game:GetService("Players")
 local GuiService       = game:GetService("GuiService")
 local LocalPlayer      = Players.LocalPlayer
 local Camera           = workspace.CurrentCamera
+local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
 
--- Безопасный доступ к PlayerGui (важно для мобильных экзекуторов)
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+-- =============================================================================
+-- ПРОВЕРКА ПОДДЕРЖКИ ЭКЗЕКУТОРА
+-- =============================================================================
+local hasHook        = hookfunction ~= nil and newcclosure ~= nil
+local hasGetRawMT    = getrawmetatable ~= nil
+local hasSetReadOnly = setreadonly ~= nil
+local hasGetConns    = getconnections ~= nil
+local hasCheckCaller = checkcaller ~= nil
+local hasIsSpoofed   = is_synapse_function ~= nil or iscclosure ~= nil
+local isMobile       = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 -- =============================================================================
 -- НАСТРОЙКИ
@@ -23,8 +38,8 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local AimbotSettings = {
     Enabled   = false,
     TeamCheck = false,
-    FOV       = 250,
-    Smoothing = 0.18,
+    FOV       = isMobile and 250 or 300,
+    Smoothing = isMobile and 0.18 or 0.15,
     Visible   = true,
     HitChance = 0.95,
 }
@@ -37,6 +52,14 @@ local ESPSettings = {
     ShowDistance  = false,
     ShowFOVCircle = true,
     RainbowESP    = false,
+}
+
+local ProtectSettings = {
+    PropertySpoof    = true,  -- скрывать WalkSpeed/JumpPower от чужого кода
+    RemoteBlock      = true,  -- блокировать подозрительные Remote'ы
+    ScriptMonitor    = true,  -- искать и отключать античит-скрипты
+    SafeInput        = true,  -- использовать экзекуторные keypress вместо VIM
+    LogBlocked       = false, -- писать в консоль что было заблокировано
 }
 
 local SpeedEnabled    = false
@@ -55,6 +78,7 @@ local Theme = {
     Accent        = Color3.fromRGB(0,   170, 100),
     AccentDark    = Color3.fromRGB(0,   120, 70),
     Danger        = Color3.fromRGB(220, 60,  60),
+    Warn          = Color3.fromRGB(220, 180, 60),
     Text          = Color3.fromRGB(235, 235, 245),
     SecondaryText = Color3.fromRGB(190, 190, 210),
     Divider       = Color3.fromRGB(55,  55,  70),
@@ -62,18 +86,270 @@ local Theme = {
 }
 
 -- =============================================================================
--- SAFE AREA (учёт выреза/чёлки)
+-- SAFE AREA
 -- =============================================================================
-local guiInset = GuiService:GetGuiInset()
-local topInset = guiInset.Y
+local guiInset  = GuiService:GetGuiInset()
+local topInset  = guiInset.Y
 local leftInset = guiInset.X
+
+-- =============================================================================
+-- ЗАЩИТА: PROPERTY SPOOFING
+-- Скрывает изменения WalkSpeed/JumpPower от чужого кода (античита)
+-- =============================================================================
+local spoofedHumanoid = nil
+local realWalkSpeed   = 16
+local realJumpPower   = 50
+
+local function installPropertySpoof()
+    if not ProtectSettings.PropertySpoof then return end
+    if not hasGetRawMT or not hasSetReadOnly or not hasHook or not hasCheckCaller then
+        warn("[Protect] Property spoof недоступен — экзекутор не поддерживает")
+        return
+    end
+
+    local ok, err = pcall(function()
+        local mt = getrawmetatable(game)
+        if not mt then return end
+
+        local oldIndex = mt.__index
+        setreadonly(mt, false)
+
+        mt.__index = newcclosure(function(self, key)
+            -- Если это чужой вызов (античит) — отдаём реальные значения
+            if not checkcaller() then
+                if key == "WalkSpeed" and typeof(self) == "Instance" and self:IsA("Humanoid") then
+                    return realWalkSpeed
+                elseif key == "JumpPower" and typeof(self) == "Instance" and self:IsA("Humanoid") then
+                    return realJumpPower
+                end
+            end
+            return oldIndex(self, key)
+        end)
+
+        setreadonly(mt, true)
+    end)
+
+    if ok then
+        print("[Protect] Property Spoof: ACTIVE")
+    else
+        warn("[Protect] Property Spoof failed: " .. tostring(err))
+    end
+end
+
+-- Синхронизирует "реальные" значения при старте
+local function syncRealProperties()
+    if LocalPlayer.Character then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            realWalkSpeed = hum.WalkSpeed
+            realJumpPower = hum.JumpPower
+        end
+    end
+end
+
+syncRealProperties()
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    syncRealProperties()
+end)
+
+-- =============================================================================
+-- ЗАЩИТА: БЛОКИРОВКА ПОДОЗРИТЕЛЬНЫХ REMOTE'ОВ
+-- Блокирует FireServer на Remote'ы, которые не вызываются нормальной игрой
+-- =============================================================================
+local suspiciousRemotes = {} -- таблица имён, которые блокируем
+
+local KNOWN_ANTICHEAT_PATTERNS = {
+    "anticheat", "anti_cheat", "detect", "ban", "kick", "flag",
+    "report", "log", "suspicious", "honeypot", "cheat",
+    "exploit", "admin_check", "validate", "integrity",
+    "iac", "adonis", "krnl_check", "swing_detect",
+}
+
+local function isSuspiciousRemote(name)
+    local lower = name:lower()
+    for _, pattern in ipairs(KNOWN_ANTICHEAT_PATTERNS) do
+        if lower:find(pattern, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function scanForSuspiciousRemotes()
+    local found = {}
+    for _, obj in pairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+            if isSuspiciousRemote(obj.Name) then
+                table.insert(found, obj.Name)
+                suspiciousRemotes[obj.Name] = true
+            end
+        end
+    end
+    return found
+end
+
+local function installRemoteBlock()
+    if not ProtectSettings.RemoteBlock then return end
+    if not hasGetRawMT or not hasSetReadOnly or not hasHook then
+        warn("[Protect] Remote block недоступен")
+        return
+    end
+
+    -- Первичное сканирование
+    local found = scanForSuspiciousRemotes()
+    if #found > 0 then
+        print("[Protect] Найдено подозрительных Remote: " .. #found)
+    end
+
+    local ok, err = pcall(function()
+        local mt = getrawmetatable(game)
+        local oldNamecall = mt.__namecall
+        setreadonly(mt, false)
+
+        mt.__namecall = newcclosure(function(self, ...)
+            local method = getnamecallmethod and getnamecallmethod() or nil
+            if method == "FireServer" and typeof(self) == "Instance" then
+                if suspiciousRemotes[self.Name] then
+                    if ProtectSettings.LogBlocked then
+                        print("[Protect] Blocked: " .. self.Name)
+                    end
+                    return -- блокируем
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+
+        setreadonly(mt, true)
+    end)
+
+    if ok then
+        print("[Protect] Remote Blocker: ACTIVE")
+    else
+        warn("[Protect] Remote Blocker failed: " .. tostring(err))
+    end
+end
+
+-- =============================================================================
+-- ЗАЩИТА: МОНИТОРИНГ НОВЫХ СКРИПТОВ
+-- Ищет новые LocalScript/Script, похожие на античит, и отключает их
+-- =============================================================================
+local knownScripts = {}
+
+local function markExistingScripts()
+    for _, obj in pairs(game:GetDescendants()) do
+        if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
+            knownScripts[obj] = true
+        end
+    end
+end
+
+local function handleNewScript(obj)
+    if knownScripts[obj] then return end
+    knownScripts[obj] = true
+
+    local lower = obj.Name:lower()
+    for _, pattern in ipairs(KNOWN_ANTICHEAT_PATTERNS) do
+        if lower:find(pattern, 1, true) then
+            if obj:IsA("LocalScript") or obj:IsA("Script") then
+                pcall(function()
+                    obj.Disabled = true
+                end)
+                if ProtectSettings.LogBlocked then
+                    print("[Protect] Disabled script: " .. obj.Name)
+                end
+            end
+            return
+        end
+    end
+end
+
+local function installScriptMonitor()
+    if not ProtectSettings.ScriptMonitor then return end
+
+    markExistingScripts()
+
+    game.DescendantAdded:Connect(function(obj)
+        if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
+            task.defer(handleNewScript, obj)
+        end
+    end)
+
+    print("[Protect] Script Monitor: ACTIVE")
+end
+
+-- =============================================================================
+-- ЗАЩИТА: БЕЗОПАСНАЯ СИМУЛЯЦИЯ ВВОДА
+-- =============================================================================
+local function safeKeyPress(keyCode)
+    if not ProtectSettings.SafeInput then
+        -- fallback через VirtualInputManager
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendKeyEvent(true, keyCode, false, game)
+        return
+    end
+
+    -- Используем функции экзекутора, если доступны
+    if syn and syn.keypress then
+        pcall(syn.keypress, keyCode)
+    elseif fluxus and fluxus.keypress then
+        pcall(fluxus.keypress, keyCode)
+    elseif KRNL_LOADED and keypress then
+        pcall(keypress, keyCode)
+    elseif keypress then
+        pcall(keypress, keyCode)
+    else
+        -- fallback
+        local vim = game:GetService("VirtualInputManager")
+        pcall(function()
+            vim:SendKeyEvent(true, keyCode, false, game)
+        end)
+    end
+end
+
+local function safeKeyRelease(keyCode)
+    if not ProtectSettings.SafeInput then
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendKeyEvent(false, keyCode, false, game)
+        return
+    end
+
+    if syn and syn.keyrelease then
+        pcall(syn.keyrelease, keyCode)
+    elseif fluxus and fluxus.keyrelease then
+        pcall(fluxus.keyrelease, keyCode)
+    elseif keyrelease then
+        pcall(keyrelease, keyCode)
+    else
+        local vim = game:GetService("VirtualInputManager")
+        pcall(function()
+            vim:SendKeyEvent(false, keyCode, false, game)
+        end)
+    end
+end
+
+-- =============================================================================
+-- УСТАНОВКА ЗАЩИТЫ
+-- =============================================================================
+installPropertySpoof()
+installRemoteBlock()
+installScriptMonitor()
+
+-- =============================================================================
+-- БИНДЫ
+-- =============================================================================
+local Binds = {
+    OpenMenu = Enum.KeyCode.M,
+    Aimbot   = Enum.KeyCode.E,
+    Speed    = Enum.KeyCode.V,
+}
 
 -- =============================================================================
 -- FOV КРУГ
 -- =============================================================================
 local FOVring = Drawing.new("Circle")
 FOVring.Visible      = true
-FOVring.Thickness    = 2
+FOVring.Thickness    = isMobile and 2 or 1.5
 FOVring.Radius       = AimbotSettings.FOV
 FOVring.Transparency = 1
 FOVring.Color        = Color3.fromRGB(255, 128, 128)
@@ -84,10 +360,11 @@ FOVring.NumSides     = 60
 -- =============================================================================
 -- ВОДЯНОЙ ЗНАК
 -- =============================================================================
+local wmWidth = isMobile and 140 or 120
 local watermarkBg = Drawing.new("Square")
 watermarkBg.Visible      = true
-watermarkBg.Position     = Vector2.new(Camera.ViewportSize.X - 175, topInset + 5)
-watermarkBg.Size         = Vector2.new(140, 55)
+watermarkBg.Position     = Vector2.new(Camera.ViewportSize.X - wmWidth - 10, topInset + 5)
+watermarkBg.Size         = Vector2.new(wmWidth, 55)
 watermarkBg.Thickness    = 1
 watermarkBg.Filled       = true
 watermarkBg.Color        = Color3.fromRGB(0, 0, 0)
@@ -95,18 +372,18 @@ watermarkBg.Transparency = 0.7
 
 local watermark = Drawing.new("Text")
 watermark.Visible      = true
-watermark.Position     = Vector2.new(Camera.ViewportSize.X - 165, topInset + 10)
-watermark.Size         = 20
+watermark.Position     = Vector2.new(Camera.ViewportSize.X - wmWidth, topInset + 10)
+watermark.Size         = isMobile and 18 or 22
 watermark.Center       = false
 watermark.Outline      = true
 watermark.OutlineColor = Color3.fromRGB(0,0,0)
 watermark.Color        = Color3.fromRGB(180, 180, 180)
-watermark.Text         = "lin4ik | MOBILE"
+watermark.Text         = isMobile and "lin4ik | MOBILE" or "lin4ik"
 watermark.Font         = Drawing.Fonts.Monospace
 
 local fpsText = Drawing.new("Text")
 fpsText.Visible      = true
-fpsText.Position     = Vector2.new(Camera.ViewportSize.X - 165, topInset + 32)
+fpsText.Position     = Vector2.new(Camera.ViewportSize.X - wmWidth, topInset + 32)
 fpsText.Size         = 15
 fpsText.Center       = false
 fpsText.Outline      = true
@@ -116,19 +393,7 @@ fpsText.Text         = "FPS: 60"
 fpsText.Font         = Drawing.Fonts.Monospace
 
 -- =============================================================================
--- СВОЙ HP
--- =============================================================================
-local selfHPText = Drawing.new("Text")
-selfHPText.Visible      = true
-selfHPText.Center       = true
-selfHPText.Outline      = true
-selfHPText.OutlineColor = Color3.fromRGB(0,0,0)
-selfHPText.Color        = Color3.fromRGB(220, 220, 220)
-selfHPText.Size         = 24
-selfHPText.Font         = Drawing.Fonts.Monospace
-
--- =============================================================================
--- УВЕДОМЛЕНИЯ (мобильный тост)
+-- УВЕДОМЛЕНИЯ
 -- =============================================================================
 local notifText = Drawing.new("Text")
 notifText.Visible      = false
@@ -155,52 +420,33 @@ local function notify(text, color)
 end
 
 -- =============================================================================
--- РАДУЖНАЯ АНИМАЦИЯ + FPS
--- =============================================================================
-local rainbowTime = 0
-RunService.RenderStepped:Connect(function(delta)
-    rainbowTime += delta * 1.2
-    fpsText.Text = "FPS: " .. math.floor(1 / delta + 0.5)
-
-    if ESPSettings.RainbowESP then
-        local color = Color3.fromHSV(rainbowTime % 1, 1, 1)
-        watermark.Color = color
-        for _, data in pairs(espElements or {}) do
-            data.nameTag.Color = color
-            data.healthText.Color = color
-            for _, line in ipairs(data.lines) do line.Color = color end
-        end
-    end
-end)
-
--- Обновление позиций UI при повороте экрана
-Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-    FOVring.Position     = Camera.ViewportSize / 2
-    watermarkBg.Position = Vector2.new(Camera.ViewportSize.X - 175, topInset + 5)
-    watermark.Position   = Vector2.new(Camera.ViewportSize.X - 165, topInset + 10)
-    fpsText.Position     = Vector2.new(Camera.ViewportSize.X - 165, topInset + 32)
-    notifText.Position   = Vector2.new(Camera.ViewportSize.X / 2, topInset + 100)
-end)
-
--- =============================================================================
 -- СВОЙ HP
 -- =============================================================================
+local selfHPText = Drawing.new("Text")
+selfHPText.Visible      = true
+selfHPText.Center       = true
+selfHPText.Outline      = true
+selfHPText.OutlineColor = Color3.fromRGB(0,0,0)
+selfHPText.Color        = Color3.fromRGB(220, 220, 220)
+selfHPText.Size         = isMobile and 24 or 26
+selfHPText.Font         = Drawing.Fonts.Monospace
+
 RunService.RenderStepped:Connect(function()
     local char = LocalPlayer.Character
     if not char then selfHPText.Visible = false return end
 
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    local head     = char:FindFirstChild("Head")
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local head = char:FindFirstChild("Head")
 
-    if humanoid and head then
+    if hum and head then
         local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 2.8, 0))
         if onScreen then
-            local hpPerc = math.clamp(math.floor(humanoid.Health / humanoid.MaxHealth * 100 + 0.5), 0, 100)
-            selfHPText.Text = hpPerc .. "%"
+            local hp = math.clamp(math.floor(hum.Health / hum.MaxHealth * 100 + 0.5), 0, 100)
+            selfHPText.Text = hp .. "%"
             selfHPText.Position = Vector2.new(screenPos.X, screenPos.Y - 30)
             selfHPText.Visible = true
-            selfHPText.Color = hpPerc > 70 and Color3.fromRGB(100, 220, 140)
-                or hpPerc > 30 and Color3.fromRGB(220, 180, 60)
+            selfHPText.Color = hp > 70 and Color3.fromRGB(100, 220, 140)
+                or hp > 30 and Color3.fromRGB(220, 180, 60)
                 or Color3.fromRGB(220, 60, 60)
         else
             selfHPText.Visible = false
@@ -211,9 +457,36 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- =============================================================================
--- AIMBOT ЛОГИКА
+-- РАДУГА + FPS + РЕСАЙЗ
 -- =============================================================================
-local function isVisible(targetPart)
+local rainbowTime = 0
+RunService.RenderStepped:Connect(function(delta)
+    rainbowTime += delta * 1.2
+    fpsText.Text = "FPS: " .. math.floor(1 / delta + 0.5)
+
+    if ESPSettings.RainbowESP then
+        local c = Color3.fromHSV(rainbowTime % 1, 1, 1)
+        watermark.Color = c
+        for _, data in pairs(espElements or {}) do
+            data.nameTag.Color = c
+            data.healthText.Color = c
+            for _, line in ipairs(data.lines) do line.Color = c end
+        end
+    end
+end)
+
+Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+    FOVring.Position     = Camera.ViewportSize / 2
+    watermarkBg.Position = Vector2.new(Camera.ViewportSize.X - wmWidth - 10, topInset + 5)
+    watermark.Position   = Vector2.new(Camera.ViewportSize.X - wmWidth, topInset + 10)
+    fpsText.Position     = Vector2.new(Camera.ViewportSize.X - wmWidth, topInset + 32)
+    notifText.Position   = Vector2.new(Camera.ViewportSize.X / 2, topInset + 100)
+end)
+
+-- =============================================================================
+-- AIMBOT
+-- =============================================================================
+local function isTargetVisible(targetPart)
     if not AimbotSettings.Visible then return true end
     local origin = Camera.CFrame.Position
     local dir    = (targetPart.Position - origin).Unit * 1000
@@ -231,17 +504,12 @@ local function getClosest()
             local head = v.Character:FindFirstChild("Head")
             local hum  = v.Character:FindFirstChildOfClass("Humanoid")
             local hrp  = v.Character:FindFirstChild("HumanoidRootPart")
-
             if head and hum and hrp and hum.Health > 0 then
-                if AimbotSettings.TeamCheck and v.Team == LocalPlayer.Team then
-                    continue
-                end
+                if AimbotSettings.TeamCheck and v.Team == LocalPlayer.Team then continue end
                 local headPos = head.Position
-                local closestPoint = Ray.new(Camera.CFrame.Position, Camera.CFrame.LookVector * 5000):ClosestPoint(headPos)
-                local distToRay = (headPos - closestPoint).Magnitude
-                if distToRay < mag then
-                    mag, target = distToRay, v
-                end
+                local closest = Ray.new(Camera.CFrame.Position, Camera.CFrame.LookVector * 5000):ClosestPoint(headPos)
+                local dist = (headPos - closest).Magnitude
+                if dist < mag then mag, target = dist, v end
             end
         end
     end
@@ -261,9 +529,10 @@ local function updateLearning(success)
     FOVring.Radius = AimbotSettings.FOV
 end
 
--- Аимбот теперь на ТОГГЛЕ (не hold) — так удобнее на мобиле
 RunService.RenderStepped:Connect(function()
     if not AimbotSettings.Enabled then return end
+    -- На ПК — hold. На мобиле — toggle
+    if not isMobile and not UserInputService:IsKeyDown(Binds.Aimbot) then return end
 
     local cam = Camera
     local screenCenter = cam.ViewportSize / 2
@@ -275,15 +544,14 @@ RunService.RenderStepped:Connect(function()
     if not head then return end
 
     local headPos = head.Position
-    local ssHead, onScreen = cam:WorldToViewportPoint(headPos)
-    local screenHead = Vector2.new(ssHead.X, ssHead.Y)
+    local ss, onScreen = cam:WorldToViewportPoint(headPos)
+    local screenHead = Vector2.new(ss.X, ss.Y)
 
     if onScreen and (screenHead - screenCenter).Magnitude < AimbotSettings.FOV then
-        if not isVisible(head) then return end
+        if not isTargetVisible(head) then return end
         local targetCFrame = CFrame.new(cam.CFrame.Position, headPos)
         cam.CFrame = cam.CFrame:Lerp(targetCFrame, AimbotSettings.Smoothing)
-        local hitChance = math.random() < AimbotSettings.HitChance
-        updateLearning(hitChance)
+        updateLearning(math.random() < AimbotSettings.HitChance)
     end
 end)
 
@@ -294,7 +562,6 @@ local espElements = {}
 
 local function createESP(player)
     if player == LocalPlayer or espElements[player] then return end
-
     local esp = {}
 
     esp.nameTag = Drawing.new("Text")
@@ -323,12 +590,12 @@ local function createESP(player)
 
     esp.lines = {}
     for i = 1, 4 do
-        local line = Drawing.new("Line")
-        line.Visible      = false
-        line.Thickness    = 1.5
-        line.Transparency = 1
-        line.Color        = Color3.fromRGB(200, 200, 200)
-        table.insert(esp.lines, line)
+        local ln = Drawing.new("Line")
+        ln.Visible = false
+        ln.Thickness = 1.5
+        ln.Transparency = 1
+        ln.Color = Color3.fromRGB(200, 200, 200)
+        table.insert(esp.lines, ln)
     end
 
     espElements[player] = esp
@@ -343,7 +610,7 @@ end
 
 local function updateESP()
     if not ESPSettings.Enabled then
-        for _, data in pairs(espElements) do hideESPData(data) end
+        for _, d in pairs(espElements) do hideESPData(d) end
         FOVring.Visible = ESPSettings.ShowFOVCircle
         return
     end
@@ -362,23 +629,23 @@ local function updateESP()
                 if onScreen then
                     local top    = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
                     local bottom = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3, 0))
-                    local height = math.abs(top.Y - bottom.Y)
-                    local width  = height * 0.55
+                    local h = math.abs(top.Y - bottom.Y)
+                    local w = h * 0.55
 
-                    local left  = Vector2.new(rootPos.X - width/2, top.Y)
-                    local right = Vector2.new(rootPos.X + width/2, top.Y)
-                    local bl    = Vector2.new(left.X,  bottom.Y)
-                    local br    = Vector2.new(right.X, bottom.Y)
+                    local L  = Vector2.new(rootPos.X - w/2, top.Y)
+                    local R  = Vector2.new(rootPos.X + w/2, top.Y)
+                    local BL = Vector2.new(L.X, bottom.Y)
+                    local BR = Vector2.new(R.X, bottom.Y)
 
                     if ESPSettings.ShowBox then
                         local c = ESPSettings.RainbowESP
                             and Color3.fromHSV((tick() * 0.8) % 1, 1, 1)
                             or Color3.fromRGB(200, 200, 200)
                         for _, ln in ipairs(data.lines) do ln.Color = c end
-                        data.lines[1].From = left;  data.lines[1].To = right; data.lines[1].Visible = true
-                        data.lines[2].From = right; data.lines[2].To = br;    data.lines[2].Visible = true
-                        data.lines[3].From = br;    data.lines[3].To = bl;    data.lines[3].Visible = true
-                        data.lines[4].From = bl;    data.lines[4].To = left;  data.lines[4].Visible = true
+                        data.lines[1].From = L;  data.lines[1].To = R;  data.lines[1].Visible = true
+                        data.lines[2].From = R;  data.lines[2].To = BR; data.lines[2].Visible = true
+                        data.lines[3].From = BR; data.lines[3].To = BL; data.lines[3].Visible = true
+                        data.lines[4].From = BL; data.lines[4].To = L;  data.lines[4].Visible = true
                     else
                         for _, ln in ipairs(data.lines) do ln.Visible = false end
                     end
@@ -392,14 +659,14 @@ local function updateESP()
                     end
 
                     if ESPSettings.ShowHP then
-                        local hpPerc = math.clamp(math.floor(hum.Health / hum.MaxHealth * 100), 0, 100)
-                        data.healthText.Text = hpPerc .. "%"
+                        local hp = math.clamp(math.floor(hum.Health / hum.MaxHealth * 100), 0, 100)
+                        data.healthText.Text = hp .. "%"
                         if not ESPSettings.RainbowESP then
-                            data.healthText.Color = hpPerc > 70 and Color3.fromRGB(100, 220, 140)
-                                or hpPerc > 30 and Color3.fromRGB(220, 180, 60)
+                            data.healthText.Color = hp > 70 and Color3.fromRGB(100, 220, 140)
+                                or hp > 30 and Color3.fromRGB(220, 180, 60)
                                 or Color3.fromRGB(220, 60, 60)
                         end
-                        data.healthText.Position = Vector2.new(right.X + 6, rootPos.Y - 10)
+                        data.healthText.Position = Vector2.new(R.X + 6, rootPos.Y - 10)
                         data.healthText.Visible = true
                     else
                         data.healthText.Visible = false
@@ -426,7 +693,6 @@ local function updateESP()
             hideESPData(data)
         end
     end
-
     FOVring.Visible = ESPSettings.ShowFOVCircle
 end
 
@@ -445,30 +711,28 @@ end)
 RunService.RenderStepped:Connect(updateESP)
 
 -- =============================================================================
--- МОБИЛЬНАЯ GUI
+-- GUI
 -- =============================================================================
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name          = "DMArenaMobile"
-screenGui.ResetOnSpawn  = false
+screenGui.Name = "DMArenaFull"
+screenGui.ResetOnSpawn = false
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.IgnoreGuiInset = true
-screenGui.Parent        = PlayerGui
+screenGui.Parent = PlayerGui
 
--- =============================================================================
--- ПЛАВАЮЩАЯ КНОПКА ОТКРЫТИЯ МЕНЮ (FAB)
--- =============================================================================
+-- FAB (мобила) / кнопка для ПК
 local fab = Instance.new("TextButton")
-fab.Name             = "FAB"
-fab.Size             = UDim2.new(0, 56, 0, 56)
-fab.Position         = UDim2.new(0, leftInset + 14, 0.35, 0)
+fab.Name = "FAB"
+fab.Size = isMobile and UDim2.new(0, 56, 0, 56) or UDim2.new(0, 44, 0, 44)
+fab.Position = UDim2.new(0, leftInset + 14, 0.35, 0)
 fab.BackgroundColor3 = Theme.Accent
-fab.Text             = "☰"
-fab.TextColor3       = Color3.new(1,1,1)
-fab.TextSize         = 28
-fab.Font             = Enum.Font.GothamBold
-fab.AutoButtonColor  = false
-fab.BorderSizePixel  = 0
-fab.Parent           = screenGui
+fab.Text = "☰"
+fab.TextColor3 = Color3.new(1,1,1)
+fab.TextSize = isMobile and 28 or 22
+fab.Font = Enum.Font.GothamBold
+fab.AutoButtonColor = false
+fab.BorderSizePixel = 0
+fab.Parent = screenGui
 Instance.new("UICorner", fab).CornerRadius = UDim.new(1)
 
 local fabStroke = Instance.new("UIStroke", fab)
@@ -476,14 +740,11 @@ fabStroke.Color = Color3.fromRGB(255,255,255)
 fabStroke.Transparency = 0.7
 fabStroke.Thickness = 2
 
--- Перетаскивание FAB по экрану
-local fabDragging = false
-local fabDragStart, fabStartPos, fabMoved
+local fabDragging, fabDragStart, fabStartPos, fabMoved
 fab.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch
     or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        fabDragging  = true
-        fabMoved     = false
+        fabDragging, fabMoved = true, false
         fabDragStart = input.Position
         fabStartPos  = fab.Position
     end
@@ -492,9 +753,7 @@ UserInputService.InputChanged:Connect(function(input)
     if fabDragging and (input.UserInputType == Enum.UserInputType.Touch
     or input.UserInputType == Enum.UserInputType.MouseMovement) then
         local delta = input.Position - fabDragStart
-        if math.abs(delta.X) > 5 or math.abs(delta.Y) > 5 then
-            fabMoved = true
-        end
+        if math.abs(delta.X) > 5 or math.abs(delta.Y) > 5 then fabMoved = true end
         fab.Position = UDim2.new(
             fabStartPos.X.Scale, fabStartPos.X.Offset + delta.X,
             fabStartPos.Y.Scale, fabStartPos.Y.Offset + delta.Y
@@ -509,97 +768,97 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 fab.MouseButton1Click:Connect(function()
     if fabMoved then return end
-    screenGui:FindFirstChild("MainFrame").Visible = not screenGui:FindFirstChild("MainFrame").Visible
+    local mf = screenGui:FindFirstChild("MainFrame")
+    if mf then mf.Visible = not mf.Visible end
 end)
 
--- =============================================================================
--- КНОПКИ AIMBOT И SPEED (плавающие, справа)
--- =============================================================================
-local function makeActionButton(text, yPos, color, onClick)
-    local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(0, 60, 0, 60)
-    btn.Position         = UDim2.new(1, -74, 0, yPos)
-    btn.BackgroundColor3 = color
-    btn.Text             = text
-    btn.TextColor3       = Color3.new(1,1,1)
-    btn.TextSize         = 22
-    btn.Font             = Enum.Font.GothamBold
-    btn.AutoButtonColor  = false
-    btn.BorderSizePixel  = 0
-    btn.Parent           = screenGui
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(1)
-    local stroke = Instance.new("UIStroke", btn)
-    stroke.Color = Color3.fromRGB(255,255,255)
-    stroke.Transparency = 0.7
-    stroke.Thickness = 2
+-- Кнопки action (только мобила)
+local aimBtn, speedBtn
 
-    local dragging, dragStart, startPos, moved
-    btn.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging, moved = true, false
-            dragStart = input.Position
-            startPos  = btn.Position
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local delta = input.Position - dragStart
-            if math.abs(delta.X) > 5 or math.abs(delta.Y) > 5 then moved = true end
-            btn.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch
-        or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            if dragging and not moved then
-                onClick()
+if isMobile then
+    local function makeActionButton(text, yPos, color, onClick)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 60, 0, 60)
+        btn.Position = UDim2.new(1, -74, 0, yPos)
+        btn.BackgroundColor3 = color
+        btn.Text = text
+        btn.TextColor3 = Color3.new(1,1,1)
+        btn.TextSize = 22
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.BorderSizePixel = 0
+        btn.Parent = screenGui
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(1)
+        local st = Instance.new("UIStroke", btn)
+        st.Color = Color3.fromRGB(255,255,255)
+        st.Transparency = 0.7
+        st.Thickness = 2
+
+        local dg, ds, sp, mv
+        btn.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dg, mv = true, false
+                ds = input.Position
+                sp = btn.Position
             end
-            dragging = false
-        end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if dg and (input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement) then
+                local delta = input.Position - ds
+                if math.abs(delta.X) > 5 or math.abs(delta.Y) > 5 then mv = true end
+                btn.Position = UDim2.new(
+                    sp.X.Scale, sp.X.Offset + delta.X,
+                    sp.Y.Scale, sp.Y.Offset + delta.Y
+                )
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                if dg and not mv then onClick() end
+                dg = false
+            end
+        end)
+        return btn
+    end
+
+    aimBtn = makeActionButton("◎", topInset + 150, Color3.fromRGB(180, 60, 60), function()
+        AimbotSettings.Enabled = not AimbotSettings.Enabled
+        aimBtn.BackgroundColor3 = AimbotSettings.Enabled and Theme.Accent or Color3.fromRGB(180, 60, 60)
+        notify(AimbotSettings.Enabled and "Aimbot: ON" or "Aimbot: OFF")
     end)
-    return btn
+
+    speedBtn = makeActionButton("»", topInset + 220, Color3.fromRGB(60, 100, 180), function()
+        SpeedEnabled = not SpeedEnabled
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                if SpeedEnabled then
+                    NormalWalkSpeed = hum.WalkSpeed
+                    hum.WalkSpeed = BoostSpeed
+                else
+                    hum.WalkSpeed = NormalWalkSpeed
+                end
+                realWalkSpeed = hum.WalkSpeed
+            end
+        end
+        speedBtn.BackgroundColor3 = SpeedEnabled and Theme.Accent or Color3.fromRGB(60, 100, 180)
+        notify(SpeedEnabled and "Speed: ON" or "Speed: OFF")
+    end)
 end
 
-local aimBtn = makeActionButton("◎", topInset + 150, Color3.fromRGB(180, 60, 60), function()
-    AimbotSettings.Enabled = not AimbotSettings.Enabled
-    aimBtn.BackgroundColor3 = AimbotSettings.Enabled and Theme.Accent or Color3.fromRGB(180, 60, 60)
-    notify(AimbotSettings.Enabled and "Aimbot: ON" or "Aimbot: OFF")
-end)
-
-local speedBtn = makeActionButton("»", topInset + 220, Color3.fromRGB(60, 100, 180), function()
-    SpeedEnabled = not SpeedEnabled
-    local char = LocalPlayer.Character
-    if char then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            if SpeedEnabled then
-                NormalWalkSpeed = hum.WalkSpeed
-                hum.WalkSpeed = BoostSpeed
-            else
-                hum.WalkSpeed = NormalWalkSpeed
-            end
-        end
-    end
-    speedBtn.BackgroundColor3 = SpeedEnabled and Theme.Accent or Color3.fromRGB(60, 100, 180)
-    notify(SpeedEnabled and "Speed: ON" or "Speed: OFF")
-end)
-
--- =============================================================================
--- ГЛАВНОЕ МЕНЮ
--- =============================================================================
+-- Главное меню
 local mainFrame = Instance.new("Frame")
-mainFrame.Name             = "MainFrame"
-mainFrame.Size             = UDim2.new(0, 300, 0, 460)
-mainFrame.Position         = UDim2.new(0.5, -150, 0.5, -230)
+mainFrame.Name = "MainFrame"
+mainFrame.Size = isMobile and UDim2.new(0, 300, 0, 460) or UDim2.new(0, 340, 0, 560)
+mainFrame.Position = UDim2.new(0.5, -mainFrame.Size.X.Offset/2, 0.5, -mainFrame.Size.Y.Offset/2)
 mainFrame.BackgroundColor3 = Theme.Background
-mainFrame.BorderSizePixel  = 0
-mainFrame.Visible          = false
-mainFrame.Parent           = screenGui
+mainFrame.BorderSizePixel = 0
+mainFrame.Visible = false
+mainFrame.Parent = screenGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 16)
 
 local mainStroke = Instance.new("UIStroke", mainFrame)
@@ -608,40 +867,38 @@ mainStroke.Transparency = 0.4
 mainStroke.Thickness = 1.5
 
 local titleBar = Instance.new("Frame")
-titleBar.Size             = UDim2.new(1, 0, 0, 50)
+titleBar.Size = UDim2.new(1, 0, 0, 50)
 titleBar.BackgroundColor3 = Theme.Background2
-titleBar.BorderSizePixel  = 0
-titleBar.Parent           = mainFrame
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
 Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 16)
 
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Size             = UDim2.new(1, -70, 1, 0)
-titleLabel.Position         = UDim2.new(0, 16, 0, 0)
+titleLabel.Size = UDim2.new(1, -70, 1, 0)
+titleLabel.Position = UDim2.new(0, 16, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text             = "lin4ik MOBILE"
-titleLabel.TextColor3       = Theme.Text
-titleLabel.TextSize         = 19
-titleLabel.Font             = Enum.Font.GothamBold
-titleLabel.TextXAlignment   = Enum.TextXAlignment.Left
-titleLabel.Parent           = titleBar
+titleLabel.Text = isMobile and "lin4ik MOBILE" or "lin4ik Menu"
+titleLabel.TextColor3 = Theme.Text
+titleLabel.TextSize = isMobile and 19 or 20
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = titleBar
 
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size             = UDim2.new(0, 36, 0, 36)
-closeBtn.Position         = UDim2.new(1, -44, 0.5, -18)
+closeBtn.Size = UDim2.new(0, 36, 0, 36)
+closeBtn.Position = UDim2.new(1, -44, 0.5, -18)
 closeBtn.BackgroundColor3 = Theme.Danger
-closeBtn.Text             = "✕"
-closeBtn.TextColor3       = Color3.new(1,1,1)
-closeBtn.TextSize         = 18
-closeBtn.Font             = Enum.Font.GothamBold
-closeBtn.AutoButtonColor  = false
-closeBtn.BorderSizePixel  = 0
-closeBtn.Parent           = titleBar
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.new(1,1,1)
+closeBtn.TextSize = 18
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.AutoButtonColor = false
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = titleBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(1)
-closeBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = false
-end)
+closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
 
--- Перетаскивание меню (тач)
+-- Drag
 local mDrag, mDragStart, mStartPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch
@@ -668,43 +925,43 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- ВКЛАДКИ
+-- Вкладки
 local tabBar = Instance.new("Frame")
-tabBar.Size             = UDim2.new(1, -20, 0, 42)
-tabBar.Position         = UDim2.new(0, 10, 0, 56)
+tabBar.Size = UDim2.new(1, -20, 0, 42)
+tabBar.Position = UDim2.new(0, 10, 0, 56)
 tabBar.BackgroundTransparency = 1
-tabBar.Parent           = mainFrame
+tabBar.Parent = mainFrame
 
-local tabNames   = {"ESP", "AIM", "BINDS"}
+local tabNames = {"ESP", "AIM", "PROTECT", "BINDS"}
 local tabButtons = {}
 local contentFrames = {}
 
 for i, name in ipairs(tabNames) do
     local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(1/#tabNames, -4, 1, 0)
-    btn.Position         = UDim2.new((i-1)/#tabNames, 2, 0, 0)
+    btn.Size = UDim2.new(1/#tabNames, -4, 1, 0)
+    btn.Position = UDim2.new((i-1)/#tabNames, 2, 0, 0)
     btn.BackgroundColor3 = (i == 1) and Theme.Accent or Theme.ToggleOff
-    btn.Text             = name
-    btn.TextColor3       = Theme.Text
-    btn.TextSize         = 16
-    btn.Font             = Enum.Font.GothamBold
-    btn.BorderSizePixel  = 0
-    btn.AutoButtonColor  = false
-    btn.Parent           = tabBar
+    btn.Text = name
+    btn.TextColor3 = Theme.Text
+    btn.TextSize = 14
+    btn.Font = Enum.Font.GothamBold
+    btn.AutoButtonColor = false
+    btn.BorderSizePixel = 0
+    btn.Parent = tabBar
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
     tabButtons[name] = btn
 
     local scroll = Instance.new("ScrollingFrame")
-    scroll.Size                 = UDim2.new(1, -20, 1, -110)
-    scroll.Position             = UDim2.new(0, 10, 0, 106)
+    scroll.Size = UDim2.new(1, -20, 1, -110)
+    scroll.Position = UDim2.new(0, 10, 0, 106)
     scroll.BackgroundTransparency = 1
-    scroll.BorderSizePixel      = 0
-    scroll.ScrollBarThickness   = 4
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 4
     scroll.ScrollBarImageColor3 = Theme.Accent
-    scroll.CanvasSize           = UDim2.new(0, 0, 0, 600)
-    scroll.Visible              = (i == 1)
-    scroll.Parent               = mainFrame
-    contentFrames[name]         = scroll
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 800)
+    scroll.Visible = (i == 1)
+    scroll.Parent = mainFrame
+    contentFrames[name] = scroll
 end
 
 for name, btn in pairs(tabButtons) do
@@ -716,50 +973,48 @@ for name, btn in pairs(tabButtons) do
     end)
 end
 
--- =============================================================================
--- СОЗДАНИЕ ТОГГЛА (mobile friendly — большие кнопки)
--- =============================================================================
+-- Toggle
 local function createToggle(parent, name, initial, callback, yPos)
     local cont = Instance.new("Frame")
-    cont.Size                 = UDim2.new(1, -10, 0, 52)
-    cont.Position             = UDim2.new(0, 5, 0, yPos)
-    cont.BackgroundColor3     = Theme.Background2
-    cont.BorderSizePixel      = 0
-    cont.Parent               = parent
+    cont.Size = UDim2.new(1, -10, 0, 52)
+    cont.Position = UDim2.new(0, 5, 0, yPos)
+    cont.BackgroundColor3 = Theme.Background2
+    cont.BorderSizePixel = 0
+    cont.Parent = parent
     Instance.new("UICorner", cont).CornerRadius = UDim.new(0, 10)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size             = UDim2.new(0.65, 0, 1, 0)
-    lbl.Position         = UDim2.new(0, 14, 0, 0)
+    lbl.Size = UDim2.new(0.65, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
-    lbl.Text             = name
-    lbl.TextColor3       = Theme.Text
-    lbl.TextSize         = 16
-    lbl.Font             = Enum.Font.GothamSemibold
-    lbl.TextXAlignment   = Enum.TextXAlignment.Left
-    lbl.Parent           = cont
+    lbl.Text = name
+    lbl.TextColor3 = Theme.Text
+    lbl.TextSize = 15
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = cont
 
     local bg = Instance.new("Frame")
-    bg.Size             = UDim2.new(0, 58, 0, 30)
-    bg.Position         = UDim2.new(1, -74, 0.5, -15)
+    bg.Size = UDim2.new(0, 58, 0, 30)
+    bg.Position = UDim2.new(1, -74, 0.5, -15)
     bg.BackgroundColor3 = initial and Theme.Accent or Theme.ToggleOff
-    bg.BorderSizePixel  = 0
-    bg.Parent           = cont
+    bg.BorderSizePixel = 0
+    bg.Parent = cont
     Instance.new("UICorner", bg).CornerRadius = UDim.new(1)
 
     local knob = Instance.new("Frame")
-    knob.Size             = UDim2.new(0, 24, 0, 24)
-    knob.Position         = initial and UDim2.new(0, 30, 0.5, -12) or UDim2.new(0, 4, 0.5, -12)
+    knob.Size = UDim2.new(0, 24, 0, 24)
+    knob.Position = initial and UDim2.new(0, 30, 0.5, -12) or UDim2.new(0, 4, 0.5, -12)
     knob.BackgroundColor3 = Color3.fromRGB(255,255,255)
-    knob.BorderSizePixel  = 0
-    knob.Parent           = bg
+    knob.BorderSizePixel = 0
+    knob.Parent = bg
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1)
 
     local btn = Instance.new("TextButton")
-    btn.Size                 = UDim2.new(1, 0, 1, 0)
+    btn.Size = UDim2.new(1, 0, 1, 0)
     btn.BackgroundTransparency = 1
-    btn.Text                 = ""
-    btn.Parent               = cont
+    btn.Text = ""
+    btn.Parent = cont
 
     local state = initial
     btn.MouseButton1Click:Connect(function()
@@ -773,72 +1028,68 @@ local function createToggle(parent, name, initial, callback, yPos)
     end)
 end
 
--- =============================================================================
--- СОЗДАНИЕ СЛАЙДЕРА (mobile friendly)
--- =============================================================================
+-- Slider
 local function createSlider(parent, name, min, max, initial, callback, yPos)
     local cont = Instance.new("Frame")
-    cont.Size                 = UDim2.new(1, -10, 0, 66)
-    cont.Position             = UDim2.new(0, 5, 0, yPos)
-    cont.BackgroundColor3     = Theme.Background2
-    cont.BorderSizePixel      = 0
-    cont.Parent               = parent
+    cont.Size = UDim2.new(1, -10, 0, 66)
+    cont.Position = UDim2.new(0, 5, 0, yPos)
+    cont.BackgroundColor3 = Theme.Background2
+    cont.BorderSizePixel = 0
+    cont.Parent = parent
     Instance.new("UICorner", cont).CornerRadius = UDim.new(0, 10)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size             = UDim2.new(1, -20, 0, 22)
-    lbl.Position         = UDim2.new(0, 14, 0, 6)
+    lbl.Size = UDim2.new(1, -20, 0, 22)
+    lbl.Position = UDim2.new(0, 14, 0, 6)
     lbl.BackgroundTransparency = 1
-    lbl.Text             = name .. ": " .. tostring(initial)
-    lbl.TextColor3       = Theme.Text
-    lbl.TextSize         = 15
-    lbl.Font             = Enum.Font.GothamSemibold
-    lbl.TextXAlignment   = Enum.TextXAlignment.Left
-    lbl.Parent           = cont
+    lbl.Text = name .. ": " .. tostring(initial)
+    lbl.TextColor3 = Theme.Text
+    lbl.TextSize = 15
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = cont
 
     local sliderBg = Instance.new("Frame")
-    sliderBg.Size             = UDim2.new(1, -28, 0, 12)
-    sliderBg.Position         = UDim2.new(0, 14, 0, 38)
+    sliderBg.Size = UDim2.new(1, -28, 0, 12)
+    sliderBg.Position = UDim2.new(0, 14, 0, 38)
     sliderBg.BackgroundColor3 = Theme.ToggleOff
-    sliderBg.BorderSizePixel  = 0
-    sliderBg.Parent           = cont
+    sliderBg.BorderSizePixel = 0
+    sliderBg.Parent = cont
     Instance.new("UICorner", sliderBg).CornerRadius = UDim.new(1)
 
     local fill = Instance.new("Frame")
-    fill.Size             = UDim2.new((initial - min) / (max - min), 0, 1, 0)
+    fill.Size = UDim2.new((initial - min) / (max - min), 0, 1, 0)
     fill.BackgroundColor3 = Theme.Accent
-    fill.BorderSizePixel  = 0
-    fill.Parent           = sliderBg
+    fill.BorderSizePixel = 0
+    fill.Parent = sliderBg
     Instance.new("UICorner", fill).CornerRadius = UDim.new(1)
 
-    -- Невидимая большая область для удобного тапа пальцем
     local touchArea = Instance.new("TextButton")
-    touchArea.Size             = UDim2.new(1, 0, 0, 30)
-    touchArea.Position         = UDim2.new(0, 0, 0.5, -15)
+    touchArea.Size = UDim2.new(1, 0, 0, 30)
+    touchArea.Position = UDim2.new(0, 0, 0.5, -15)
     touchArea.BackgroundTransparency = 1
-    touchArea.Text             = ""
-    touchArea.Parent           = sliderBg
+    touchArea.Text = ""
+    touchArea.Parent = sliderBg
 
     local dragging = false
-    local function updateFromX(x)
+    local function update(x)
         local rel = math.clamp((x - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X, 0, 1)
         local val = math.floor(min + (max - min) * rel + 0.5)
         fill.Size = UDim2.new(rel, 0, 1, 0)
-        lbl.Text  = name .. ": " .. tostring(val)
+        lbl.Text = name .. ": " .. tostring(val)
         callback(val)
     end
-
     touchArea.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch
         or input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
-            updateFromX(input.Position.X)
+            update(input.Position.X)
         end
     end)
     UserInputService.InputChanged:Connect(function(input)
         if dragging and (input.UserInputType == Enum.UserInputType.Touch
         or input.UserInputType == Enum.UserInputType.MouseMovement) then
-            updateFromX(input.Position.X)
+            update(input.Position.X)
         end
     end)
     UserInputService.InputEnded:Connect(function(input)
@@ -849,80 +1100,94 @@ local function createSlider(parent, name, min, max, initial, callback, yPos)
     end)
 end
 
--- =============================================================================
--- ЗАПОЛНЕНИЕ ВКЛАДОК
--- =============================================================================
-local yESP = 5
-createToggle(contentFrames["ESP"], "ESP Enabled",     ESPSettings.Enabled,       function(v) ESPSettings.Enabled = v end, yESP) yESP += 58
-createToggle(contentFrames["ESP"], "Show Box",        ESPSettings.ShowBox,       function(v) ESPSettings.ShowBox = v end, yESP) yESP += 58
-createToggle(contentFrames["ESP"], "Show Name",       ESPSettings.ShowName,      function(v) ESPSettings.ShowName = v end, yESP) yESP += 58
-createToggle(contentFrames["ESP"], "Show HP %",       ESPSettings.ShowHP,        function(v) ESPSettings.ShowHP = v end, yESP) yESP += 58
-createToggle(contentFrames["ESP"], "Show Distance",   ESPSettings.ShowDistance,  function(v) ESPSettings.ShowDistance = v end, yESP) yESP += 58
+-- Заполнение вкладки ESP
+local y = 5
+createToggle(contentFrames["ESP"], "ESP Enabled",     ESPSettings.Enabled,       function(v) ESPSettings.Enabled = v end, y) y += 58
+createToggle(contentFrames["ESP"], "Show Box",        ESPSettings.ShowBox,       function(v) ESPSettings.ShowBox = v end, y) y += 58
+createToggle(contentFrames["ESP"], "Show Name",       ESPSettings.ShowName,      function(v) ESPSettings.ShowName = v end, y) y += 58
+createToggle(contentFrames["ESP"], "Show HP %",       ESPSettings.ShowHP,        function(v) ESPSettings.ShowHP = v end, y) y += 58
+createToggle(contentFrames["ESP"], "Show Distance",   ESPSettings.ShowDistance,  function(v) ESPSettings.ShowDistance = v end, y) y += 58
 createToggle(contentFrames["ESP"], "Show FOV Circle", ESPSettings.ShowFOVCircle, function(v)
     ESPSettings.ShowFOVCircle = v
     FOVring.Visible = v
-end, yESP) yESP += 58
-createToggle(contentFrames["ESP"], "Rainbow ESP",     ESPSettings.RainbowESP,    function(v) ESPSettings.RainbowESP = v end, yESP) yESP += 58
+end, y) y += 58
+createToggle(contentFrames["ESP"], "Rainbow ESP",     ESPSettings.RainbowESP,    function(v) ESPSettings.RainbowESP = v end, y) y += 58
 
-local yAIM = 5
+-- Заполнение вкладки AIM
+y = 5
 createToggle(contentFrames["AIM"], "Aimbot Enabled", AimbotSettings.Enabled,   function(v)
     AimbotSettings.Enabled = v
-    aimBtn.BackgroundColor3 = v and Theme.Accent or Color3.fromRGB(180, 60, 60)
-end, yAIM) yAIM += 58
-createToggle(contentFrames["AIM"], "Team Check",     AimbotSettings.TeamCheck, function(v) AimbotSettings.TeamCheck = v end, yAIM) yAIM += 58
-createToggle(contentFrames["AIM"], "Visible Only",   AimbotSettings.Visible,   function(v) AimbotSettings.Visible = v end, yAIM) yAIM += 58
-
+    if aimBtn then
+        aimBtn.BackgroundColor3 = v and Theme.Accent or Color3.fromRGB(180, 60, 60)
+    end
+end, y) y += 58
+createToggle(contentFrames["AIM"], "Team Check",     AimbotSettings.TeamCheck, function(v) AimbotSettings.TeamCheck = v end, y) y += 58
+createToggle(contentFrames["AIM"], "Visible Only",   AimbotSettings.Visible,   function(v) AimbotSettings.Visible = v end, y) y += 58
 createSlider(contentFrames["AIM"], "FOV",       50, 800, AimbotSettings.FOV, function(v)
     AimbotSettings.FOV = v
     FOVring.Radius = v
-end, yAIM) yAIM += 72
-
+end, y) y += 72
 createSlider(contentFrames["AIM"], "Smoothing", 1, 100, math.floor(AimbotSettings.Smoothing * 100), function(v)
     AimbotSettings.Smoothing = v / 100
-end, yAIM) yAIM += 72
+end, y) y += 72
 
--- Вкладка биндов (для тех, у кого есть блютус-клавиатура)
+-- Заполнение вкладки PROTECT
+y = 5
+createToggle(contentFrames["PROTECT"], "Property Spoof",  ProtectSettings.PropertySpoof, function(v)
+    ProtectSettings.PropertySpoof = v
+    notify(v and "Property Spoof: ON (рестарт)" or "Property Spoof: OFF")
+end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Remote Block",    ProtectSettings.RemoteBlock, function(v)
+    ProtectSettings.RemoteBlock = v
+    notify(v and "Remote Block: ON (рестарт)" or "Remote Block: OFF")
+end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Script Monitor",  ProtectSettings.ScriptMonitor, function(v)
+    ProtectSettings.ScriptMonitor = v
+end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Safe Input",      ProtectSettings.SafeInput, function(v)
+    ProtectSettings.SafeInput = v
+end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Log Blocked",     ProtectSettings.LogBlocked, function(v)
+    ProtectSettings.LogBlocked = v
+end, y) y += 58
+
+-- Заполнение вкладки BINDS
 local bindsContent = contentFrames["BINDS"]
 local bindY = 5
 local listeningFor = nil
-local Binds = {
-    OpenMenu = Enum.KeyCode.M,
-    Aimbot   = Enum.KeyCode.E,
-    Speed    = Enum.KeyCode.V,
-}
 
 local function createBindRow(name, defaultKey)
     local frame = Instance.new("Frame")
-    frame.Size                 = UDim2.new(1, -10, 0, 52)
-    frame.Position             = UDim2.new(0, 5, 0, bindY)
-    frame.BackgroundColor3     = Theme.Background2
-    frame.BorderSizePixel      = 0
-    frame.Parent               = bindsContent
-    frame.Name                 = name
+    frame.Size = UDim2.new(1, -10, 0, 52)
+    frame.Position = UDim2.new(0, 5, 0, bindY)
+    frame.BackgroundColor3 = Theme.Background2
+    frame.BorderSizePixel = 0
+    frame.Parent = bindsContent
+    frame.Name = name
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size             = UDim2.new(0.55, 0, 1, 0)
-    lbl.Position         = UDim2.new(0, 14, 0, 0)
+    lbl.Size = UDim2.new(0.55, 0, 1, 0)
+    lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
-    lbl.Text             = name
-    lbl.TextColor3       = Theme.Text
-    lbl.TextSize         = 15
-    lbl.Font             = Enum.Font.GothamSemibold
-    lbl.TextXAlignment   = Enum.TextXAlignment.Left
-    lbl.Parent           = frame
+    lbl.Text = name
+    lbl.TextColor3 = Theme.Text
+    lbl.TextSize = 15
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = frame
 
     local keyBtn = Instance.new("TextButton")
-    keyBtn.Size             = UDim2.new(0, 110, 0, 36)
-    keyBtn.Position         = UDim2.new(1, -124, 0.5, -18)
+    keyBtn.Size = UDim2.new(0, 110, 0, 36)
+    keyBtn.Position = UDim2.new(1, -124, 0.5, -18)
     keyBtn.BackgroundColor3 = Theme.Accent
-    keyBtn.Text             = UserInputService:GetStringForKeyCode(defaultKey) or "None"
-    keyBtn.TextColor3       = Color3.new(1,1,1)
-    keyBtn.TextSize         = 14
-    keyBtn.Font             = Enum.Font.GothamBold
-    keyBtn.AutoButtonColor  = false
-    keyBtn.BorderSizePixel  = 0
-    keyBtn.Parent           = frame
+    keyBtn.Text = UserInputService:GetStringForKeyCode(defaultKey) or "None"
+    keyBtn.TextColor3 = Color3.new(1,1,1)
+    keyBtn.TextSize = 14
+    keyBtn.Font = Enum.Font.GothamBold
+    keyBtn.AutoButtonColor = false
+    keyBtn.BorderSizePixel = 0
+    keyBtn.Parent = frame
     Instance.new("UICorner", keyBtn).CornerRadius = UDim.new(0, 8)
 
     keyBtn.MouseButton1Click:Connect(function()
@@ -940,20 +1205,16 @@ createBindRow("Aimbot",   Binds.Aimbot)
 createBindRow("Speed",    Binds.Speed)
 
 -- =============================================================================
--- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК КЛАВИАТУРЫ (для блютус-клавиатур)
+-- ОБРАБОТЧИК ВВОДА
 -- =============================================================================
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
 
     if listeningFor then
         local key = input.KeyCode
         if key ~= Enum.KeyCode.Unknown then
-            if key == Enum.KeyCode.Backspace then
-                Binds[listeningFor] = nil
-            else
-                Binds[listeningFor] = key
-            end
+            Binds[listeningFor] = (key == Enum.KeyCode.Backspace) and nil or key
             for _, child in ipairs(bindsContent:GetChildren()) do
                 if child.Name == listeningFor then
                     local btn = child:FindFirstChildWhichIsA("TextButton")
@@ -971,6 +1232,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if input.KeyCode == Binds.OpenMenu then
         mainFrame.Visible = not mainFrame.Visible
     end
+
     if input.KeyCode == Binds.Speed then
         SpeedEnabled = not SpeedEnabled
         local char = LocalPlayer.Character
@@ -983,31 +1245,42 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
                 else
                     hum.WalkSpeed = NormalWalkSpeed
                 end
+                realWalkSpeed = hum.WalkSpeed
             end
         end
-        speedBtn.BackgroundColor3 = SpeedEnabled and Theme.Accent or Color3.fromRGB(60, 100, 180)
+        if speedBtn then
+            speedBtn.BackgroundColor3 = SpeedEnabled and Theme.Accent or Color3.fromRGB(60, 100, 180)
+        end
         notify(SpeedEnabled and "Speed: ON" or "Speed: OFF")
     end
 end)
 
--- Сохранение скорости при респавне
+-- Сохранение скорости
 LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
+    syncRealProperties()
     if SpeedEnabled then
         local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then hum.WalkSpeed = BoostSpeed end
+        if hum then
+            hum.WalkSpeed = BoostSpeed
+            realWalkSpeed = BoostSpeed
+        end
     end
 end)
 
 -- =============================================================================
 -- СТАРТ
 -- =============================================================================
-notify("lin4ik MOBILE загружено!", Color3.fromRGB(100, 220, 140))
+notify("lin4ik загружено!", Color3.fromRGB(100, 220, 140))
 task.delay(2, function()
-    notify("Тапни ☰ слева", Color3.fromRGB(200, 200, 255))
-end)
-task.delay(4, function()
-    notify("◎ = аимбот, » = скорость", Color3.fromRGB(200, 200, 255))
+    if isMobile then
+        notify("Тапни ☰ слева", Color3.fromRGB(200, 200, 255))
+    else
+        notify("Нажми M для меню", Color3.fromRGB(200, 200, 255))
+    end
 end)
 
-print("[DM Arena MOBILE] Загружено | FAB слева, aim/speed справа")
+print("[DM Arena] Загружено | Protection: " ..
+    (ProtectSettings.PropertySpoof and "Spoof " or "") ..
+    (ProtectSettings.RemoteBlock and "Remote " or "") ..
+    (ProtectSettings.ScriptMonitor and "Monitor" or ""))
