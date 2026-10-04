@@ -1,13 +1,16 @@
 --[[
-    DM Arena Hub - FULL EDITION
-    ПК + Mobile + Anti-Detect (игровые античиты)
+    DM Arena Hub - SAFE EDITION
+    БЕЗ хуков метаметодов (__namecall / __index)
     
-    Встроено:
-    - Property Spoofing (WalkSpeed, JumpPower)
-    - Блокировка honeypot RemoteEvent
-    - Мониторинг новых Script/LocalScript
-    - Безопасная симуляция ввода
-    - FOV, Smoothing, ESP, Aimbot, Speed
+    Убрано:
+    - Property Spoof (__index hook)  ← вызывал "Humanoid tampering"
+    - Remote Blocker (__namecall hook) ← вызывал "NamecallInstance detector"
+    
+    Оставлено:
+    - Script Monitor (без хуков)
+    - Connection Killer (через getconnections)
+    - Safe Input
+    - FOV, ESP, Aimbot, Speed
 ]]
 
 -- =============================================================================
@@ -22,15 +25,10 @@ local Camera           = workspace.CurrentCamera
 local PlayerGui        = LocalPlayer:WaitForChild("PlayerGui")
 
 -- =============================================================================
--- ПРОВЕРКА ПОДДЕРЖКИ ЭКЗЕКУТОРА
+-- ПРОВЕРКА ПОДДЕРЖКИ
 -- =============================================================================
-local hasHook        = hookfunction ~= nil and newcclosure ~= nil
-local hasGetRawMT    = getrawmetatable ~= nil
-local hasSetReadOnly = setreadonly ~= nil
-local hasGetConns    = getconnections ~= nil
-local hasCheckCaller = checkcaller ~= nil
-local hasIsSpoofed   = is_synapse_function ~= nil or iscclosure ~= nil
-local isMobile       = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local hasGetConns = getconnections ~= nil
+local isMobile    = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 -- =============================================================================
 -- НАСТРОЙКИ
@@ -55,11 +53,11 @@ local ESPSettings = {
 }
 
 local ProtectSettings = {
-    PropertySpoof    = true,  -- скрывать WalkSpeed/JumpPower от чужого кода
-    RemoteBlock      = true,  -- блокировать подозрительные Remote'ы
-    ScriptMonitor    = true,  -- искать и отключать античит-скрипты
-    SafeInput        = true,  -- использовать экзекуторные keypress вместо VIM
-    LogBlocked       = false, -- писать в консоль что было заблокировано
+    ScriptMonitor   = true,  -- без хуков
+    ConnectionKill  = false, -- по умолчанию ВЫКЛ — может сломать игру
+    SafeInput       = true,
+    LogBlocked      = false,
+    SmoothSpeed     = true,  -- плавное изменение WalkSpeed
 }
 
 local SpeedEnabled    = false
@@ -81,7 +79,6 @@ local Theme = {
     Warn          = Color3.fromRGB(220, 180, 60),
     Text          = Color3.fromRGB(235, 235, 245),
     SecondaryText = Color3.fromRGB(190, 190, 210),
-    Divider       = Color3.fromRGB(55,  55,  70),
     ToggleOff     = Color3.fromRGB(70,  70,  85),
 }
 
@@ -93,150 +90,25 @@ local topInset  = guiInset.Y
 local leftInset = guiInset.X
 
 -- =============================================================================
--- ЗАЩИТА: PROPERTY SPOOFING
--- Скрывает изменения WalkSpeed/JumpPower от чужого кода (античита)
+-- ЗАЩИТА: SCRIPT MONITOR (без хуков)
 -- =============================================================================
-local spoofedHumanoid = nil
-local realWalkSpeed   = 16
-local realJumpPower   = 50
+local knownScripts = {}
 
-local function installPropertySpoof()
-    if not ProtectSettings.PropertySpoof then return end
-    if not hasGetRawMT or not hasSetReadOnly or not hasHook or not hasCheckCaller then
-        warn("[Protect] Property spoof недоступен — экзекутор не поддерживает")
-        return
-    end
-
-    local ok, err = pcall(function()
-        local mt = getrawmetatable(game)
-        if not mt then return end
-
-        local oldIndex = mt.__index
-        setreadonly(mt, false)
-
-        mt.__index = newcclosure(function(self, key)
-            -- Если это чужой вызов (античит) — отдаём реальные значения
-            if not checkcaller() then
-                if key == "WalkSpeed" and typeof(self) == "Instance" and self:IsA("Humanoid") then
-                    return realWalkSpeed
-                elseif key == "JumpPower" and typeof(self) == "Instance" and self:IsA("Humanoid") then
-                    return realJumpPower
-                end
-            end
-            return oldIndex(self, key)
-        end)
-
-        setreadonly(mt, true)
-    end)
-
-    if ok then
-        print("[Protect] Property Spoof: ACTIVE")
-    else
-        warn("[Protect] Property Spoof failed: " .. tostring(err))
-    end
-end
-
--- Синхронизирует "реальные" значения при старте
-local function syncRealProperties()
-    if LocalPlayer.Character then
-        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            realWalkSpeed = hum.WalkSpeed
-            realJumpPower = hum.JumpPower
-        end
-    end
-end
-
-syncRealProperties()
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    syncRealProperties()
-end)
-
--- =============================================================================
--- ЗАЩИТА: БЛОКИРОВКА ПОДОЗРИТЕЛЬНЫХ REMOTE'ОВ
--- Блокирует FireServer на Remote'ы, которые не вызываются нормальной игрой
--- =============================================================================
-local suspiciousRemotes = {} -- таблица имён, которые блокируем
-
-local KNOWN_ANTICHEAT_PATTERNS = {
-    "anticheat", "anti_cheat", "detect", "ban", "kick", "flag",
-    "report", "log", "suspicious", "honeypot", "cheat",
-    "exploit", "admin_check", "validate", "integrity",
-    "iac", "adonis", "krnl_check", "swing_detect",
+local ANTICHEAT_PATTERNS = {
+    "anticheat", "anti_cheat", "detector", "detection", "honeypot",
+    "ban_check", "kick_check", "flag_check", "integrity_check",
+    "iac", "adonis", "krnl_detect", "swing_detect", "humanoid_check",
 }
 
-local function isSuspiciousRemote(name)
+local function isAnticheatName(name)
     local lower = name:lower()
-    for _, pattern in ipairs(KNOWN_ANTICHEAT_PATTERNS) do
-        if lower:find(pattern, 1, true) then
-            return true
-        end
+    for _, pattern in ipairs(ANTICHEAT_PATTERNS) do
+        if lower:find(pattern, 1, true) then return true end
     end
     return false
 end
 
-local function scanForSuspiciousRemotes()
-    local found = {}
-    for _, obj in pairs(game:GetDescendants()) do
-        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            if isSuspiciousRemote(obj.Name) then
-                table.insert(found, obj.Name)
-                suspiciousRemotes[obj.Name] = true
-            end
-        end
-    end
-    return found
-end
-
-local function installRemoteBlock()
-    if not ProtectSettings.RemoteBlock then return end
-    if not hasGetRawMT or not hasSetReadOnly or not hasHook then
-        warn("[Protect] Remote block недоступен")
-        return
-    end
-
-    -- Первичное сканирование
-    local found = scanForSuspiciousRemotes()
-    if #found > 0 then
-        print("[Protect] Найдено подозрительных Remote: " .. #found)
-    end
-
-    local ok, err = pcall(function()
-        local mt = getrawmetatable(game)
-        local oldNamecall = mt.__namecall
-        setreadonly(mt, false)
-
-        mt.__namecall = newcclosure(function(self, ...)
-            local method = getnamecallmethod and getnamecallmethod() or nil
-            if method == "FireServer" and typeof(self) == "Instance" then
-                if suspiciousRemotes[self.Name] then
-                    if ProtectSettings.LogBlocked then
-                        print("[Protect] Blocked: " .. self.Name)
-                    end
-                    return -- блокируем
-                end
-            end
-            return oldNamecall(self, ...)
-        end)
-
-        setreadonly(mt, true)
-    end)
-
-    if ok then
-        print("[Protect] Remote Blocker: ACTIVE")
-    else
-        warn("[Protect] Remote Blocker failed: " .. tostring(err))
-    end
-end
-
--- =============================================================================
--- ЗАЩИТА: МОНИТОРИНГ НОВЫХ СКРИПТОВ
--- Ищет новые LocalScript/Script, похожие на античит, и отключает их
--- =============================================================================
-local knownScripts = {}
-
-local function markExistingScripts()
+local function markExisting()
     for _, obj in pairs(game:GetDescendants()) do
         if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
             knownScripts[obj] = true
@@ -248,72 +120,106 @@ local function handleNewScript(obj)
     if knownScripts[obj] then return end
     knownScripts[obj] = true
 
-    local lower = obj.Name:lower()
-    for _, pattern in ipairs(KNOWN_ANTICHEAT_PATTERNS) do
-        if lower:find(pattern, 1, true) then
-            if obj:IsA("LocalScript") or obj:IsA("Script") then
-                pcall(function()
-                    obj.Disabled = true
-                end)
-                if ProtectSettings.LogBlocked then
-                    print("[Protect] Disabled script: " .. obj.Name)
-                end
+    if isAnticheatName(obj.Name) then
+        pcall(function()
+            if obj:IsA("Script") or obj:IsA("LocalScript") then
+                obj.Disabled = true
             end
-            return
+        end)
+        if ProtectSettings.LogBlocked then
+            print("[Protect] Disabled: " .. obj.Name)
         end
     end
 end
 
 local function installScriptMonitor()
     if not ProtectSettings.ScriptMonitor then return end
-
-    markExistingScripts()
-
+    markExisting()
     game.DescendantAdded:Connect(function(obj)
         if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then
             task.defer(handleNewScript, obj)
         end
     end)
-
     print("[Protect] Script Monitor: ACTIVE")
 end
 
 -- =============================================================================
--- ЗАЩИТА: БЕЗОПАСНАЯ СИМУЛЯЦИЯ ВВОДА
+-- ЗАЩИТА: CONNECTION KILLER (через getconnections — БЕЗ хуков)
+-- Отключает соединения, привязанные к античит-скриптам
 -- =============================================================================
-local function safeKeyPress(keyCode)
-    if not ProtectSettings.SafeInput then
-        -- fallback через VirtualInputManager
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendKeyEvent(true, keyCode, false, game)
+local killedConnections = {}
+
+local function scanAndKillConnections()
+    if not hasGetConns then return end
+
+    for _, obj in pairs(game:GetDescendants()) do
+        if (obj:IsA("Script") or obj:IsA("LocalScript")) and isAnticheatName(obj.Name) then
+            local ok, conns = pcall(getconnections, obj)
+            if ok and conns then
+                for _, conn in ipairs(conns) do
+                    if not killedConnections[conn] then
+                        killedConnections[conn] = true
+                        pcall(function()
+                            if conn.Disable then
+                                conn:Disable()
+                            end
+                        end)
+                        if ProtectSettings.LogBlocked then
+                            print("[Protect] Disabled connection on: " .. obj.Name)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function installConnectionKiller()
+    if not ProtectSettings.ConnectionKill then return end
+    if not hasGetConns then
+        warn("[Protect] Connection Killer недоступен")
         return
     end
 
-    -- Используем функции экзекутора, если доступны
+    task.spawn(function()
+        while task.wait(3) do
+            pcall(scanAndKillConnections)
+        end
+    end)
+
+    print("[Protect] Connection Killer: ACTIVE")
+end
+
+-- =============================================================================
+-- ЗАЩИТА: SAFE INPUT
+-- =============================================================================
+local function safeKeyPress(keyCode)
+    if not ProtectSettings.SafeInput then
+        pcall(function()
+            game:GetService("VirtualInputManager"):SendKeyEvent(true, keyCode, false, game)
+        end)
+        return
+    end
     if syn and syn.keypress then
         pcall(syn.keypress, keyCode)
     elseif fluxus and fluxus.keypress then
         pcall(fluxus.keypress, keyCode)
-    elseif KRNL_LOADED and keypress then
-        pcall(keypress, keyCode)
     elseif keypress then
         pcall(keypress, keyCode)
     else
-        -- fallback
-        local vim = game:GetService("VirtualInputManager")
         pcall(function()
-            vim:SendKeyEvent(true, keyCode, false, game)
+            game:GetService("VirtualInputManager"):SendKeyEvent(true, keyCode, false, game)
         end)
     end
 end
 
 local function safeKeyRelease(keyCode)
     if not ProtectSettings.SafeInput then
-        local vim = game:GetService("VirtualInputManager")
-        vim:SendKeyEvent(false, keyCode, false, game)
+        pcall(function()
+            game:GetService("VirtualInputManager"):SendKeyEvent(false, keyCode, false, game)
+        end)
         return
     end
-
     if syn and syn.keyrelease then
         pcall(syn.keyrelease, keyCode)
     elseif fluxus and fluxus.keyrelease then
@@ -321,19 +227,55 @@ local function safeKeyRelease(keyCode)
     elseif keyrelease then
         pcall(keyrelease, keyCode)
     else
-        local vim = game:GetService("VirtualInputManager")
         pcall(function()
-            vim:SendKeyEvent(false, keyCode, false, game)
+            game:GetService("VirtualInputManager"):SendKeyEvent(false, keyCode, false, game)
         end)
     end
 end
 
 -- =============================================================================
+-- ЗАЩИТА: ПЛАВНОЕ ИЗМЕНЕНИЕ WALKSPEED
+-- Вместо резкого 16 → 28 делаем плавный переход за ~0.3 сек
+-- =============================================================================
+local currentSpeedTween = nil
+
+local function setWalkSpeedSmooth(humanoid, target, duration)
+    if not ProtectSettings.SmoothSpeed then
+        humanoid.WalkSpeed = target
+        return
+    end
+
+    if currentSpeedTween then
+        pcall(function() currentSpeedTween:Cancel() end)
+        currentSpeedTween = nil
+    end
+
+    local start = humanoid.WalkSpeed
+    local startTime = tick()
+    duration = duration or 0.3
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not humanoid or not humanoid.Parent then
+            conn:Disconnect()
+            return
+        end
+        local elapsed = tick() - startTime
+        local alpha = math.min(elapsed / duration, 1)
+        humanoid.WalkSpeed = start + (target - start) * alpha
+        if alpha >= 1 then
+            humanoid.WalkSpeed = target
+            conn:Disconnect()
+        end
+    end)
+    currentSpeedTween = conn
+end
+
+-- =============================================================================
 -- УСТАНОВКА ЗАЩИТЫ
 -- =============================================================================
-installPropertySpoof()
-installRemoteBlock()
 installScriptMonitor()
+installConnectionKiller()
 
 -- =============================================================================
 -- БИНДЫ
@@ -413,9 +355,7 @@ local function notify(text, color)
     notifToken += 1
     local myToken = notifToken
     task.delay(1.5, function()
-        if notifToken == myToken then
-            notifText.Visible = false
-        end
+        if notifToken == myToken then notifText.Visible = false end
     end)
 end
 
@@ -531,7 +471,6 @@ end
 
 RunService.RenderStepped:Connect(function()
     if not AimbotSettings.Enabled then return end
-    -- На ПК — hold. На мобиле — toggle
     if not isMobile and not UserInputService:IsKeyDown(Binds.Aimbot) then return end
 
     local cam = Camera
@@ -714,13 +653,13 @@ RunService.RenderStepped:Connect(updateESP)
 -- GUI
 -- =============================================================================
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "DMArenaFull"
+screenGui.Name = "DMArenaSafe"
 screenGui.ResetOnSpawn = false
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.IgnoreGuiInset = true
 screenGui.Parent = PlayerGui
 
--- FAB (мобила) / кнопка для ПК
+-- FAB
 local fab = Instance.new("TextButton")
 fab.Name = "FAB"
 fab.Size = isMobile and UDim2.new(0, 56, 0, 56) or UDim2.new(0, 44, 0, 44)
@@ -772,9 +711,8 @@ fab.MouseButton1Click:Connect(function()
     if mf then mf.Visible = not mf.Visible end
 end)
 
--- Кнопки action (только мобила)
+-- Action buttons (mobile)
 local aimBtn, speedBtn
-
 if isMobile then
     local function makeActionButton(text, yPos, color, onClick)
         local btn = Instance.new("TextButton")
@@ -838,11 +776,10 @@ if isMobile then
             if hum then
                 if SpeedEnabled then
                     NormalWalkSpeed = hum.WalkSpeed
-                    hum.WalkSpeed = BoostSpeed
+                    setWalkSpeedSmooth(hum, BoostSpeed, 0.3)
                 else
-                    hum.WalkSpeed = NormalWalkSpeed
+                    setWalkSpeedSmooth(hum, NormalWalkSpeed, 0.3)
                 end
-                realWalkSpeed = hum.WalkSpeed
             end
         end
         speedBtn.BackgroundColor3 = SpeedEnabled and Theme.Accent or Color3.fromRGB(60, 100, 180)
@@ -850,7 +787,7 @@ if isMobile then
     end)
 end
 
--- Главное меню
+-- Main frame
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
 mainFrame.Size = isMobile and UDim2.new(0, 300, 0, 460) or UDim2.new(0, 340, 0, 560)
@@ -877,7 +814,7 @@ local titleLabel = Instance.new("TextLabel")
 titleLabel.Size = UDim2.new(1, -70, 1, 0)
 titleLabel.Position = UDim2.new(0, 16, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = isMobile and "lin4ik MOBILE" or "lin4ik Menu"
+titleLabel.Text = isMobile and "lin4ik SAFE" or "lin4ik Safe Menu"
 titleLabel.TextColor3 = Theme.Text
 titleLabel.TextSize = isMobile and 19 or 20
 titleLabel.Font = Enum.Font.GothamBold
@@ -898,7 +835,6 @@ closeBtn.Parent = titleBar
 Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(1)
 closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
 
--- Drag
 local mDrag, mDragStart, mStartPos
 titleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.Touch
@@ -925,7 +861,6 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- Вкладки
 local tabBar = Instance.new("Frame")
 tabBar.Size = UDim2.new(1, -20, 0, 42)
 tabBar.Position = UDim2.new(0, 10, 0, 56)
@@ -943,7 +878,7 @@ for i, name in ipairs(tabNames) do
     btn.BackgroundColor3 = (i == 1) and Theme.Accent or Theme.ToggleOff
     btn.Text = name
     btn.TextColor3 = Theme.Text
-    btn.TextSize = 14
+    btn.TextSize = 13
     btn.Font = Enum.Font.GothamBold
     btn.AutoButtonColor = false
     btn.BorderSizePixel = 0
@@ -973,7 +908,6 @@ for name, btn in pairs(tabButtons) do
     end)
 end
 
--- Toggle
 local function createToggle(parent, name, initial, callback, yPos)
     local cont = Instance.new("Frame")
     cont.Size = UDim2.new(1, -10, 0, 52)
@@ -1028,7 +962,6 @@ local function createToggle(parent, name, initial, callback, yPos)
     end)
 end
 
--- Slider
 local function createSlider(parent, name, min, max, initial, callback, yPos)
     local cont = Instance.new("Frame")
     cont.Size = UDim2.new(1, -10, 0, 66)
@@ -1100,7 +1033,7 @@ local function createSlider(parent, name, min, max, initial, callback, yPos)
     end)
 end
 
--- Заполнение вкладки ESP
+-- ESP tab
 local y = 5
 createToggle(contentFrames["ESP"], "ESP Enabled",     ESPSettings.Enabled,       function(v) ESPSettings.Enabled = v end, y) y += 58
 createToggle(contentFrames["ESP"], "Show Box",        ESPSettings.ShowBox,       function(v) ESPSettings.ShowBox = v end, y) y += 58
@@ -1113,7 +1046,7 @@ createToggle(contentFrames["ESP"], "Show FOV Circle", ESPSettings.ShowFOVCircle,
 end, y) y += 58
 createToggle(contentFrames["ESP"], "Rainbow ESP",     ESPSettings.RainbowESP,    function(v) ESPSettings.RainbowESP = v end, y) y += 58
 
--- Заполнение вкладки AIM
+-- AIM tab
 y = 5
 createToggle(contentFrames["AIM"], "Aimbot Enabled", AimbotSettings.Enabled,   function(v)
     AimbotSettings.Enabled = v
@@ -1131,27 +1064,18 @@ createSlider(contentFrames["AIM"], "Smoothing", 1, 100, math.floor(AimbotSetting
     AimbotSettings.Smoothing = v / 100
 end, y) y += 72
 
--- Заполнение вкладки PROTECT
+-- PROTECT tab
 y = 5
-createToggle(contentFrames["PROTECT"], "Property Spoof",  ProtectSettings.PropertySpoof, function(v)
-    ProtectSettings.PropertySpoof = v
-    notify(v and "Property Spoof: ON (рестарт)" or "Property Spoof: OFF")
+createToggle(contentFrames["PROTECT"], "Script Monitor",   ProtectSettings.ScriptMonitor,  function(v) ProtectSettings.ScriptMonitor = v end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Connection Kill",  ProtectSettings.ConnectionKill, function(v)
+    ProtectSettings.ConnectionKill = v
+    notify(v and "Connection Kill: ON" or "Connection Kill: OFF")
 end, y) y += 58
-createToggle(contentFrames["PROTECT"], "Remote Block",    ProtectSettings.RemoteBlock, function(v)
-    ProtectSettings.RemoteBlock = v
-    notify(v and "Remote Block: ON (рестарт)" or "Remote Block: OFF")
-end, y) y += 58
-createToggle(contentFrames["PROTECT"], "Script Monitor",  ProtectSettings.ScriptMonitor, function(v)
-    ProtectSettings.ScriptMonitor = v
-end, y) y += 58
-createToggle(contentFrames["PROTECT"], "Safe Input",      ProtectSettings.SafeInput, function(v)
-    ProtectSettings.SafeInput = v
-end, y) y += 58
-createToggle(contentFrames["PROTECT"], "Log Blocked",     ProtectSettings.LogBlocked, function(v)
-    ProtectSettings.LogBlocked = v
-end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Safe Input",       ProtectSettings.SafeInput,      function(v) ProtectSettings.SafeInput = v end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Smooth Speed",     ProtectSettings.SmoothSpeed,    function(v) ProtectSettings.SmoothSpeed = v end, y) y += 58
+createToggle(contentFrames["PROTECT"], "Log Blocked",      ProtectSettings.LogBlocked,     function(v) ProtectSettings.LogBlocked = v end, y) y += 58
 
--- Заполнение вкладки BINDS
+-- BINDS tab
 local bindsContent = contentFrames["BINDS"]
 local bindY = 5
 local listeningFor = nil
@@ -1205,7 +1129,7 @@ createBindRow("Aimbot",   Binds.Aimbot)
 createBindRow("Speed",    Binds.Speed)
 
 -- =============================================================================
--- ОБРАБОТЧИК ВВОДА
+-- ОБРАБОТЧИК КЛАВИАТУРЫ
 -- =============================================================================
 UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
@@ -1241,11 +1165,10 @@ UserInputService.InputBegan:Connect(function(input, gp)
             if hum then
                 if SpeedEnabled then
                     NormalWalkSpeed = hum.WalkSpeed
-                    hum.WalkSpeed = BoostSpeed
+                    setWalkSpeedSmooth(hum, BoostSpeed, 0.3)
                 else
-                    hum.WalkSpeed = NormalWalkSpeed
+                    setWalkSpeedSmooth(hum, NormalWalkSpeed, 0.3)
                 end
-                realWalkSpeed = hum.WalkSpeed
             end
         end
         if speedBtn then
@@ -1255,15 +1178,12 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
--- Сохранение скорости
 LocalPlayer.CharacterAdded:Connect(function(char)
     task.wait(0.5)
-    syncRealProperties()
     if SpeedEnabled then
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hum then
-            hum.WalkSpeed = BoostSpeed
-            realWalkSpeed = BoostSpeed
+            setWalkSpeedSmooth(hum, BoostSpeed, 0.3)
         end
     end
 end)
@@ -1271,7 +1191,7 @@ end)
 -- =============================================================================
 -- СТАРТ
 -- =============================================================================
-notify("lin4ik загружено!", Color3.fromRGB(100, 220, 140))
+notify("lin4ik SAFE загружено!", Color3.fromRGB(100, 220, 140))
 task.delay(2, function()
     if isMobile then
         notify("Тапни ☰ слева", Color3.fromRGB(200, 200, 255))
@@ -1280,7 +1200,4 @@ task.delay(2, function()
     end
 end)
 
-print("[DM Arena] Загружено | Protection: " ..
-    (ProtectSettings.PropertySpoof and "Spoof " or "") ..
-    (ProtectSettings.RemoteBlock and "Remote " or "") ..
-    (ProtectSettings.ScriptMonitor and "Monitor" or ""))
+print("[DM Arena SAFE] Загружено без хуков метаметодов")
